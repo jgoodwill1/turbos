@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.py[cod]
+*.so
+
+# Packaging
+build/
+dist/
+*.egg-info/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Environments
+.env
+.venv/
+env/
+
+# Data
+data/
+*.h5
+*.hdf5
+*.nc
