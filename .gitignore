@@ -20,4 +20,4 @@ env/
 *.h5
 *.hdf5
 *.nc
-*.npz
+# *.npz
