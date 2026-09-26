@@ -21,3 +21,5 @@ env/
 *.hdf5
 *.nc
 # *.npz
+
+*.csv

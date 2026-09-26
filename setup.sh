@@ -7,7 +7,7 @@ ENV_NAME="turbos"
 if conda env list | grep -q "^${ENV_NAME} "; then
     echo "Updating $ENV_NAME"
     conda env update \
-        -n "$ENV_NAME" \
+        -n "$ENV_NAME" --solver=libmamba \
         -f env.yml \
         --prune
 else
