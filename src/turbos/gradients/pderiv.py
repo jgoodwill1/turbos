@@ -4,9 +4,9 @@ import numpy as np
 
 def vec_grad(v, spatial_dims=("x", "y")):
 
-    if "comp" not in v.dims:
+    if "c" not in v.dims:
         raise ValueError(
-            f"Expected vector with 'comp' dimension. Got {v.dims}"
+            f"Expected vector with 'c' dimension. Got {v.dims}"
         )
 
     gradients = []
@@ -28,13 +28,13 @@ def vec_grad(v, spatial_dims=("x", "y")):
     )
 
     grad = grad.rename(
-        {"comp": "i"}
+        {"c": "i"}
     )
 
     # Preserve the original non-component dimension order
     base_dims = [
         d for d in v.dims
-        if d != "comp"
+        if d != "c"
     ]
 
     return grad.transpose(
@@ -42,6 +42,21 @@ def vec_grad(v, spatial_dims=("x", "y")):
         "i",
         "j",
     )
+
+
+def div(v, spatial_dims=("x", "y")):
+
+    if "c" not in v.dims:
+        raise ValueError(
+            f"Expected vector with 'c' dimension. Got {v.dims}"
+        )
+
+    divergence = 0
+    for dim in ("x", "y", "z"):
+        if dim in spatial_dims:
+            divergence += v.differentiate(dim).sel(c=dim)
+
+    return divergence
 
 
 def strain_tensor(u, spatial_dims=("x", "y")):
@@ -52,8 +67,8 @@ def strain_tensor(u, spatial_dims=("x", "y")):
     ----------
     u : xr.DataArray
         Vector field with dimensions such as
-        ('y', 'x', 'comp'),
-        where comp = ['x', 'y', 'z'].
+        ('x', 'y', 'c'),
+        where c = ['x', 'y', 'z'].
 
     spatial_dims : tuple
         Spatial coordinates along which derivatives
@@ -117,8 +132,7 @@ def strain_tensor(u, spatial_dims=("x", "y")):
     )
 
     return D.transpose(
-        "x",
-        "y",
+        *[d for d in u.dims if d != "c"],
         "i",
         "j",
     )

@@ -1,12 +1,18 @@
-from turbos.moments.pressure import dev_P
-from turbos.gradients.pderiv import vec_grad
-from turbos.gradients.pderiv import strain_tensor
+from turbos.moments.pressure import dev_P, scalar_pressure
+from turbos.gradients.pderiv import div, vec_grad, strain_tensor
 import xarray as xr
 
 
 
 
 def pressure_strain(P, u):
+    
+    p = scalar_pressure(
+        P
+    )
+
+    th = div(u)
+ 
     Pi = dev_P(
         P
     )
@@ -15,8 +21,10 @@ def pressure_strain(P, u):
         u
     )
 
+
     return xr.Dataset(
         {
+            "pth": -p * th,
             "PiD": -(Pi * D).sum(("i","j")),
         }
     )

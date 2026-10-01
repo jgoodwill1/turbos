@@ -8,7 +8,7 @@ def vector(
     z_comp,
     *,
     name=None,
-):
+) -> xr.DataArray:
     values = np.stack(
         [
             x_comp.values,
@@ -20,11 +20,11 @@ def vector(
 
     return xr.DataArray(
         values,
-        dims=("x", "y", "comp"),
+        dims=("x", "y", "c"),
         coords={
             "x": x_comp["x"],
             "y": x_comp["y"],
-            "comp": ["x", "y", "z"],
+            "c": ["x", "y", "z"],
         },
         name=name,
     )
