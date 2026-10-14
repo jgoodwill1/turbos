@@ -7,19 +7,13 @@ import xarray as xr
 
 def pressure_strain(P, u):
     
-    p = scalar_pressure(
-        P
-    )
+    p = scalar_pressure(P)
 
     th = div(u)
  
-    Pi = dev_P(
-        P
-    )
+    Pi = dev_P(P)
 
-    D = strain_tensor(
-        u
-    )
+    D = strain_tensor(u)
 
 
     return xr.Dataset(
