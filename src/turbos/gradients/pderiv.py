@@ -3,7 +3,7 @@ import numpy as np
 
 
 def vec_grad(v, spatial_dims=("x", "y")):
-
+    """Periodic centered gradient: grad[..., i, j] = ∂v_i / ∂x_j."""
     if "c" not in v.dims:
         raise ValueError(
             f"Expected vector with 'c' dimension. Got {v.dims}"
@@ -12,52 +12,44 @@ def vec_grad(v, spatial_dims=("x", "y")):
     gradients = []
 
     for dim in ("x", "y", "z"):
-
         if dim in spatial_dims:
-            dv = v.differentiate(dim)
+            if dim not in v.dims or dim not in v.coords:
+                raise ValueError(f"Missing spatial dimension/coordinate {dim}")
+
+            coord = np.asarray(v[dim].values, dtype=float)
+            if coord.size < 3:
+                raise ValueError(f"{dim} needs at least three grid points")
+
+            steps = np.diff(coord)
+            if steps[0] == 0 or not np.allclose(steps, steps[0]):
+                raise ValueError(f"{dim} must be uniformly spaced")
+
+            h = float(steps[0])
+
+            dv = (
+                v.roll({dim: -1}, roll_coords=False)
+                - v.roll({dim: 1}, roll_coords=False)
+            ) / (2 * h)
+
         else:
             dv = xr.zeros_like(v)
 
-        gradients.append(
-            dv.expand_dims(j=[dim])
-        )
+        gradients.append(dv.expand_dims(j=[dim]))
 
-    grad = xr.concat(
-        gradients,
-        dim="j",
-    )
+    grad = xr.concat(gradients, dim="j", join="exact")
+    grad = grad.rename({"c": "i"})
 
-    grad = grad.rename(
-        {"c": "i"}
-    )
-
-    # Preserve the original non-component dimension order
-    base_dims = [
-        d for d in v.dims
-        if d != "c"
-    ]
-
-    return grad.transpose(
-        *base_dims,
-        "i",
-        "j",
-    )
+    base_dims = [d for d in v.dims if d != "c"]
+    return grad.transpose(*base_dims, "i", "j")
 
 
 def div(v, spatial_dims=("x", "y")):
+    grad = vec_grad(v, spatial_dims=spatial_dims)
 
-    if "c" not in v.dims:
-        raise ValueError(
-            f"Expected vector with 'c' dimension. Got {v.dims}"
-        )
-
-    divergence = 0
-    for dim in ("x", "y", "z"):
-        if dim in spatial_dims:
-            divergence += v.differentiate(dim).sel(c=dim)
-
-    return divergence
-
+    return sum(
+        grad.sel(i=dim, j=dim, drop=True)
+        for dim in ("x", "y", "z")
+    )
 
 def strain_tensor(u, spatial_dims=("x", "y")):
     """

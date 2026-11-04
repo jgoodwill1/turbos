@@ -1,459 +1,632 @@
-#!/usr/bin/env python
-###########################################################################
-##
-## The class to handle P3D simulation data in python. An object is created 
-## that has the run parameters attached with it. The basic usage of the 
-##  class can be done in the following ways.
-##
-## Example 1:
-## > from p3d import p3d
-## > r1=p3d('OTV')
-## > r1.vars2load(['bx','by','bz'])
-## > for i in range(20):
-## >     r1.loadslice(i)
-## >     DO WHATEVER!!!
-## > r1.fin()
-##
-##
-## Example 2:
-## > from p3d import p3d
-## > r1=p3d('OTV')
-## > bxf=open('bx','rb')
-## > bx=r1.readslice(bxf,10)
-## > DO WHATEVER!!!
-## > r1.fin()
-##
-## Methods in the class:
-## 1) self.__init__(): Initialize the run object and load run parameters
-## 2) self.print_params(): Print the run parameters
-## 3) self.vars2load(): Define what variables to load, create variables
-##    and open files for reading data.
-## 4) self.readslice(): Read a time slice from an open file.
-## 5) self.loadslice(): Load a snapshot of time for all the defined variables.
-## 6) 
-##
-##                                        Tulasi Nandan Parashar
-##                                        2014/08/23
-## Hat tip to ColbyCH for teaching me the basics of classes in python.
-##
-###########################################################################
+"""
+Minimal P3D reader.
+
+Goals
+-----
+- Support legacy P3D movie files and newer HDF5 snapshots.
+- Return a consistent xarray.Dataset.
+- Keep file-format logic separate from scientific analysis.
+- Support canonical variables such as B, E, ue, ui, Pe, Pi.
+"""
+
+from pathlib import Path
 
 import numpy as np
-from os.path import basename, realpath, exists
-import Turbcopy.AnalysisFunctions as af
-from scipy.ndimage import gaussian_filter as gf
-from Turbcopy.subs import calc_dep
+import xarray as xr
 
 
-class p3d(object):
-   """p3d object:
-         Tulasi Parashar's version to read data from
-         P3D github version.
-         Created on 08/22/2014
-         Last modified on 09/09/2015
-         Last modified on 10/13/2016
-   """
-   def __init__(self,shelldirname=None,filenum=None):
-      # If no rundir specified
-      if shelldirname is None: 
-         shelldirname = input('Please enter the rundir: ') 
-      self.rundir = realpath(shelldirname)
-      self.dirname= basename(self.rundir)
-
-      # If filenum not given
-      if filenum is None:
-         self.filenum=input("Please enter the file number to load (e.g. 000): ")
-      else:
-         self.filenum=filenum
-
-      # Check where the paramfile is
-      if exists(self.rundir+'/param_'+self.dirname):
-         self.paramfile=self.rundir+'/param_'+self.dirname
-      elif exists(self.rundir+'/staging/param_'+self.dirname):
-         self.paramfile=self.rundir+'/staging/param_'+self.dirname
-      elif exists(self.rundir+'/paramfile'):
-         self.paramfile=self.rundir+'/paramfile'
-      else:
-         raise ValueError('Paramfile not found in '+self.dirname)
-      # load parameters
-      self.params=loadparams(self.paramfile)
-      for i in list(self.params.keys()):
-         self.__dict__[i]=self.params[i]
-
-      self.primitives=['bx','by','bz','ex','ey','ez','jix','jiy','jiz','jex','jey','jez','jx','jy','jz','ni','pixx','piyy','pizz','pixy','pixz','piyz','pexx','pexy','pexz','peyy','peyz','pezz','ne','rho']
-      self.field=['bx','by','bz']
-      # self.primitives=['jix','jiy','jiz','jex','jey','jez','pixx','piyy','pizz','pixy','pixz','piyz','pexx','pexy','pexz','peyy','peyz','pezz', 'ne','ni']
-      self.derived={\
-      'tex':['pexx','ne'],'tey':['peyy','ne'],'tez':['pezz','ne'],\
-      'te':['tex','tey','tez'],\
-      'tix':['pixx','ni'],'tiy':['piyy','ni'],'tiz':['pizz','ni'],\
-      'ti':['tix','tiy','tiz'],\
-      'vix':['jix','ni'],'viy':['jiy','ni'],'viz':['jiz','ni'],\
-      'vi':['vix','viy','viz'],\
-      'vex':['jex','ne'],'vey':['jey','ne'],'vez':['jez','ne'],\
-      've':['vex','vey','vez'],\
-      'omix':['viy','viz'],'omiy':['viz','vix'],'omiz':['vix','viy'],\
-      'omi':['omix','omiy','omiz'],'ensti':['omi'],'pali':['omi'],\
-      'omex':['vey','vez'],'omey':['vex','vez'],'omez':['vex','vey'],\
-      'ome':['omex','omey','omez'],'enste':['ome'],'pale':['ome'],\
-      'omx':['cmy','cmz'],'omy':['cmz','cmx'],'omz':['cmx','cmy'],\
-      'om':['omx','omy','omz'], 'enst':['om'], 'pal':['om'],\
-      'dui':['vix','viy','viz'],'due':['vex','vey','vez'],\
-      'den':['ni','ne'],\
-      'cmx':['vix','vex'],'cmy':['viy','vey'],'cmz':['viz','vez'],\
-      'zpx':['bx','cmx','den'],'zpy':['by','cmy','den'],'zpz':['bz','cmz','den'],\
-      'zmx':['bx','cmx','den'],'zmy':['by','cmy','den'],'zmz':['bz','cmz','den'],\
-      'zpzm':['zpx','zpy','zpz','zmx','zmy','zmz']\
-      }
-
-      self.allvars=self.primitives+list(self.derived.keys())
+# Native fields that can be read directly from P3D output.
+PRIMITIVES = {
+    "bx", "by", "bz",
+    "ex", "ey", "ez",
+    "jx", "jy", "jz",
+    "jex", "jey", "jez",
+    "jix", "jiy", "jiz",
+    "ne", "ni", "rho",
+    "pexx", "pexy", "pexz", "peyy", "peyz", "pezz",
+    "pixx", "pixy", "pixz", "piyy", "piyz", "pizz",
+}
 
 
-####
-#### Method to print the parameters associated with the run
-####
-   def print_params(self):
-      """
-         A quick method to print the parameters and variables attached with
-         the p3d run object.
-      """
-      for i in list(self.params.keys()):
-         print(i,' = ',self.params[i])
-####
-#### Method to define the variables to load, create variables and
-#### open corresponding files.
-#### 
-   def vars2load(self,v2lu):
-      """
-         Define the variables to load, define corresponding numpy arrays &
-         open the files
-      """
-      if len(v2lu) == 1:
-         if v2lu[0] == 'min':
-            self.vars2l=['bx','by', 'bz','jix','jiy','jz','ni']
-         elif v2lu[0] == 'prim':
-            self.vars2l=self.primitives
-         elif v2lu[0] == 'field':
-            self.vars2l=self.field
-         elif v2lu[0] == 'all':
-            self.vars2l=self.allvars
-         else:
-            # Compute all the dependencies and set variables 2 load 
-            self.vars2l=calc_dep(v2lu,self.primitives,self.derived)
-      else:
-         # Compute all the dependencies and set variables 2 load 
-         self.vars2l=calc_dep(v2lu,self.primitives,self.derived)
+# Canonical variables exposed to downstream turbos analysis.
+# These map only to native P3D fields; derived assembly happens after loading.
+CANONICAL_DEPENDENCIES = {
+    "B":  ("bx", "by", "bz"),
+    "E":  ("ex", "ey", "ez"),
+    "J":  ("jx", "jy", "jz"),
+    "Je": ("jex", "jey", "jez"),
+    "Ji": ("jix", "jiy", "jiz"),
 
-      # If byte or double byte data, open the log file.
-      if self.data_type in ("b", "bb"):
-         if exists(self.rundir+'/log'):
-            print(self.rundir+'/log')
-            self.logfile=open(self.rundir+"/log","r")
-         else:
-            print(self.rundir+'/staging/movie.log.'+self.filenum)
-            self.logfile=open(self.rundir+"/staging/movie.log."+self.filenum,"r")
-         self.szl=np.size(self.logvars)
-         self.alllogvals=np.loadtxt(self.logfile)
+    # Velocity is derived directly from current and density.
+    "ue": ("jex", "jey", "jez", "ne"),
+    "ui": ("jix", "jiy", "jiz", "ni"),
 
-      # Create arrays and open files
-      for i in self.vars2l:
-         self.__dict__[i]=np.array((self.nx,self.ny,self.nz))
-         if i in self.primitives:
-            if exists(self.rundir+'/'+i):
-               self.__dict__[i+'f']=open(self.rundir+'/'+i,"rb")
+    "Pe": ("pexx", "pexy", "pexz", "peyy", "peyz", "pezz"),
+    "Pi": ("pixx", "pixy", "pixz", "piyy", "piyz", "pizz"),
+}
+
+CANONICAL_ALL = [
+    "B", "E", "J", "Je", "Ji", "ue", "ui", "Pe", "Pi", "ne", "ni", "rho",
+]
+
+
+class P3D:
+    """
+    Small reader for P3D simulation output.
+
+    Parameters
+    ----------
+    rundir : str or Path
+        P3D run directory.
+    filenum : str, default "000"
+        Legacy movie-file number.
+    """
+
+    def __init__(self, rundir, filenum="000"):
+        self.rundir = Path(rundir).expanduser().resolve()
+        self.name = self.rundir.name
+        self.filenum = str(filenum).zfill(3)
+
+        self.paramfile = self._find_paramfile()
+        self.params = load_params(self.paramfile)
+
+        # Make common run parameters available as attributes.
+        for key, value in self.params.items():
+            setattr(self, key, value)
+
+        self.format = self._detect_format()
+
+        # Loaded lazily only for compressed legacy movie files.
+        self._movie_log = None
+        self.numslices = self._get_num_slices()
+
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
+
+    def load_xarray(self, slices, variables):
+        """
+        Load one or more snapshots as a canonical xarray.Dataset.
+
+        Examples
+        --------
+        ds = run.load_xarray(
+            0,
+            variables=["B", "ue", "Pe", "ne"],
+        )
+
+        ds = run.load_xarray(
+            range(10),
+            variables=["B", "Pe"],
+        )
+        """
+        if variables == "all":
+            variables = CANONICAL_ALL
+        elif variables == "all_raw":
+            variables = sorted(PRIMITIVES)
+        elif isinstance(variables, str):
+            variables = [variables]
+
+        requested = list(variables)
+        native = self._resolve_native(requested)
+
+        if isinstance(slices, (int, np.integer)):
+            return self._load_one(int(slices), requested, native)
+
+        datasets = [
+            self._load_one(int(index), requested, native)
+            for index in slices
+        ]
+
+        if not datasets:
+            raise ValueError("slices must contain at least one snapshot")
+
+        return xr.concat(
+            [
+                ds.expand_dims(time=[ds.attrs["time"]])
+                for ds in datasets
+            ],
+            dim="time",
+        )
+
+    # Optional shorter alias.
+    snapshot = load_xarray
+
+    # ------------------------------------------------------------------
+    # Format-independent snapshot path
+    # ------------------------------------------------------------------
+
+    def _load_one(self, index, requested, native):
+        if self.format == "hdf5":
+            raw = self._load_hdf5(index, native)
+        else:
+            raw = self._load_movie(index, native)
+
+        ds = self._canonicalize(raw, requested)
+
+        ds.attrs.update({
+            "run": self.name,
+            "snapshot": index,
+            "format": self.format,
+        })
+
+        return ds
+
+    def _resolve_native(self, requested):
+        native = []
+
+        for name in requested:
+            deps = CANONICAL_DEPENDENCIES.get(name, (name,))
+
+            for dep in deps:
+                if dep not in PRIMITIVES:
+                    raise ValueError(
+                        f"Unknown variable {name!r}; "
+                        f"{dep!r} is not a known native P3D field."
+                    )
+
+                if dep not in native:
+                    native.append(dep)
+
+        return native
+
+    # ------------------------------------------------------------------
+    # Legacy movie files
+    # ------------------------------------------------------------------
+
+    def _load_movie(self, index, variables):
+        coords = self._coords()
+        shape = (self.nx, self.ny, self.nz)
+
+        data = {}
+
+        for name in variables:
+            path = self._movie_path(name)
+            array = self._read_movie_field(path, name, index)
+
+            if array.shape != shape:
+                raise ValueError(
+                    f"{name!r} has shape {array.shape}; expected {shape}"
+                )
+
+            data[name] = (("x", "y", "z"), array)
+
+        ds = xr.Dataset(data, coords=coords)
+        ds.attrs["time"] = index * self.dtmovie
+
+        return ds.squeeze(drop=True)
+
+    def _movie_path(self, name):
+        direct = self.rundir / name
+
+        if direct.is_file():
+            return direct
+
+        staged = (
+            self.rundir
+            / "staging"
+            / f"movie.{name}.{self.filenum}"
+        )
+
+        if staged.is_file():
+            return staged
+
+        raise FileNotFoundError(
+            f"Could not find legacy movie field {name!r}"
+        )
+
+    def _read_movie_field(self, path, name, index):
+        n = self.nx * self.ny * self.nz
+        shape = (self.nx, self.ny, self.nz)
+
+        dtype_info = {
+            "b":  (np.uint8,   1),
+            "bb": (np.int16,   2),
+            "f":  (np.float32, 4),
+            "d":  (np.float64, 8),
+        }
+
+        if self.data_type not in dtype_info:
+            raise ValueError(
+                f"Unsupported P3D data_type {self.data_type!r}"
+            )
+
+        dtype, bytes_per_value = dtype_info[self.data_type]
+        offset = index * n * bytes_per_value
+
+        with path.open("rb") as f:
+            f.seek(offset)
+            values = np.fromfile(f, dtype=dtype, count=n)
+
+        if values.size != n:
+            raise IndexError(
+                f"Snapshot {index} is incomplete or absent in {path}"
+            )
+
+        values = values.reshape(shape, order="F")
+
+        # Legacy byte-compressed movie data require min/max reconstruction.
+        if self.data_type in ("b", "bb"):
+            vmin, vmax = self._movie_minmax(name, index)
+
+            if self.data_type == "b":
+                values = vmin + (vmax - vmin) * values / 255.0
             else:
-               self.__dict__[i+'f']=open(self.rundir+'/staging/movie.'+i+\
-                                    '.'+str(self.filenum).zfill(3),"rb")
-      # If 'b' or 'bb' data type, load minmax for each loaded variable
-      if self.data_type in ('b', 'bb'):
-         for i in self.vars2l:
-            if i in self.primitives:
-               self.__dict__[i+'minmax']=self.alllogvals[self.logvars.index(i)\
-                                         ::len(self.logvars),:]
-      # Find out the number of slices for the open file
-      self.__dict__[self.vars2l[0]+'f'].seek(0,2)
-      filesize=self.__dict__[self.vars2l[0]+'f'].tell()
-      numbersize=2**['b','bb','f','d'].index(self.data_type)
-      self.numslices=filesize/(self.nx*self.ny*self.nz*numbersize)
-####
-#### Method to read a particular time slice from an open file.
-#### 
-   def readslice(self,f,timeslice,v=""):
-      """
-         This method reads a particular slice of time from a given file. The
-         explicit inputs are file name, time slice and data type. It is used 
-         as:
-            output=self.readslice(filename,time)
-      """
-      ### Byte data #########################################################
-      if self.data_type == 'b':
-         f.seek(timeslice*self.nx*self.ny*self.nz)
-         field = np.fromfile(f,dtype='uint8',count=self.nx*self.ny*self.nz)
-         field = np.reshape(field,(self.nx,self.ny,self.nz),order='F')
-         minmax=self.__dict__[v+'minmax'][timeslice]
-         field = minmax[0]+(minmax[1]-minmax[0])*field/255.
-      ### Double byte data #################################################
-      elif self.data_type == 'bb':
-         f.seek(2*timeslice*self.nx*self.ny*self.nz)
-         field = np.fromfile(f,dtype='int16',count=self.nx*self.ny*self.nz)
-         field = np.reshape(field,(self.nx,self.ny,self.nz),order='F')
-         minmax=self.__dict__[v+'minmax'][timeslice]
-         field = minmax[0]+(minmax[1]-minmax[0])*(field+32678.)/65535.
-      ### Four byte (single precision) data ################################
-      elif self.data_type == 'f':
-         f.seek(4*timeslice*self.nx*self.ny*self.nz)
-         field = np.fromfile(f,dtype='float32',count=self.nx*self.ny*self.nz)
-         field = np.reshape(field,(self.nx,self.ny,self.nz),order='F').astype('float64')
-      ### Double precision data ############################################
-      elif self.data_type == 'd':
-         f.seek(8*timeslice*self.nx*self.ny*self.nz)
-         field = np.fromfile(f,dtype='float64',count=self.nx*self.ny*self.nz)
-         field = np.reshape(field,(self.nx,self.ny,self.nz),order='F')
-      return field
-####
-#### Method to load time slices for the loaded variables.
-####
-   def loadslice(self,it,smth=None):
-      """
-         Load the variables initialized by self.vars2load()
-      """
-      for i in self.vars2l:
-         if i in self.primitives:
-            self.__dict__[i]=self.readslice(self.__dict__[i+'f'],it,i)
-      for i in self.vars2l:
-         if i in self.derived:
-           #self.__dict__[i] = self._derivedv(i)
-            self._derivedv(i)
+                # Preserve the normalization used by the legacy reader.
+                values = (
+                    vmin
+                    + (vmax - vmin)
+                    * (values + 32678.0)
+                    / 65535.0
+                )
 
-      self.mmd={}
-      for i in self.vars2l:
-         if smth is not None:
-            self.__dict__[i]=gf(self.__dict__[i],sigma=smth)
-         self.mmd[i]=[self.__dict__[i].min(),self.__dict__[i].max()]
-      self.time = it*self.dtmovie
+        return values.astype(np.float64, copy=False)
 
-####
-#### Method to add attributes to the object
-####
-   def addattr(self,key,val):
-      for i in key:
-         print('Adding '+i) 
-         self.__dict__[i]=val[key.index(i)]
-         if isinstance(val[key.index(i)],np.ndarray):
-            self.mmd[i]=[self.__dict__[i].min(),self.__dict__[i].max()]
+    def _movie_minmax(self, name, index):
+        if self._movie_log is None:
+            log_path = self.rundir / "log"
 
-####
-#### Method to compute derived quantities
-####
-   def _derivedv(self,varname):
-      if varname == 'tix'   : self.tix    = self.pixx/self.ni
-      if varname == 'tiy'   : self.tiy    = self.piyy/self.ni
-      if varname == 'tiz'   : self.tiz    = self.pizz/self.ni
-      if varname == 'ti'    : self.ti     = (self.tix+self.tiy+self.tiz)/3.
-      if varname == 'tex'   : self.tex    = self.pexx/self.ne
-      if varname == 'tey'   : self.tey    = self.peyy/self.ne
-      if varname == 'tez'   : self.tez    = self.pezz/self.ne
-      if varname == 'te'    : self.te     = (self.tex+self.tey+self.tez)/3.
-      if varname == 'vix'   : self.vix    = self.jix/self.ni
-      if varname == 'viy'   : self.viy    = self.jiy/self.ni
-      if varname == 'viz'   : self.viz    = self.jiz/self.ni
-      if varname == 'omix'  : self.omix   = af.pcurlx(self.viy,self.viz,dx=self.dx,dy=self.dy,dz=self.dz)
-      if varname == 'omiy'  : self.omiy   = af.pcurly(self.viz,self.vix,dx=self.dx,dy=self.dy,dz=self.dz)
-      if varname == 'omiz'  : self.omiz   = af.pcurlz(self.vix,self.viy,dx=self.dx,dy=self.dy,dz=self.dz)
-      if varname == 'omi'   : pass
-      if varname == 'ensti' : self.ensti  = self.omix**2+self.omiy**2+self.omiz**2
-      if varname == 'dui'   : self.dui    = af.pdiv(self.vix,self.viy,self.viz,dx=self.dx,dy=self.dy,dz=self.dz)
-      if varname == 'vex'   : self.vex    = -self.jex/self.ne
-      if varname == 'vey'   : self.vey    = -self.jey/self.ne
-      if varname == 'vez'   : self.vez    = -self.jez/self.ne
-      if varname == 'omex'  : self.omex   = af.pcurlx(self.vey,self.vez,dx=self.dx,dy=self.dy,dz=self.dz)
-      if varname == 'omey'  : self.omey   = af.pcurly(self.vez,self.vex,dx=self.dx,dy=self.dy,dz=self.dz)
-      if varname == 'omez'  : self.omez   = af.pcurlz(self.vex,self.vey,dx=self.dx,dy=self.dy,dz=self.dz)
-      if varname == 'ome'   : pass
-      if varname == 'enste' : self.enste  = self.omex**2+self.omey**2+self.omez**2
-      if varname == 'due'   : self.due    = af.pdiv(self.vex,self.vey,self.vez,dx=self.dx,dy=self.dy,dz=self.dz)
-      if varname == 'cmx'   : self.cmx    = (self.vix+self.m_e*self.vex)/(1+self.m_e)
-      if varname == 'cmy'   : self.cmy    = (self.viy+self.m_e*self.vey)/(1+self.m_e)
-      if varname == 'cmz'   : self.cmz    = (self.viz+self.m_e*self.vez)/(1+self.m_e)
-      if varname == 'omx'   : self.omx    = af.pcurlx(self.cmy,self.cmz,dx=self.dx,dy=self.dy,dz=self.dz)
-      if varname == 'omy'   : self.omy    = af.pcurly(self.cmz,self.cmx,dx=self.dx,dy=self.dy,dz=self.dz)
-      if varname == 'omz'   : self.omz    = af.pcurlz(self.cmx,self.cmy,dx=self.dx,dy=self.dy,dz=self.dz)
-      if varname == 'om'    : pass
-      if varname == 'enst'  : self.enst   = self.omx**2+self.omy**2+self.omz**2
-      if varname == 'den'   : self.den    = self.ni+self.m_e*self.ne
-      if varname == 'zpx'   : self.zpx    = self.bx/np.sqrt(self.den) + self.cmx
-      if varname == 'zpy'   : self.zpy    = self.by/np.sqrt(self.den) + self.cmy
-      if varname == 'zpz'   : self.zpz    = self.bz/np.sqrt(self.den) + self.cmz
-      if varname == 'zmx'   : self.zmx    = self.bx/np.sqrt(self.den) - self.cmx
-      if varname == 'zmy'   : self.zmy    = self.by/np.sqrt(self.den) - self.cmy
-      if varname == 'zmz'   : self.zmz    = self.bz/np.sqrt(self.den) - self.cmz
-      if varname == 'zpzm'  : pass
+            if not log_path.is_file():
+                log_path = (
+                    self.rundir
+                    / "staging"
+                    / f"movie.log.{self.filenum}"
+                )
 
-      if varname == 'pali'  : 
-         tmp = af.pcurl(self.omix,self.omiy,self.omiz,dx=self.dx,dy=self.dy,dz=self.dz)
-         self.pali   = 0.5*(tmp[0]**2+tmp[1]**2+tmp[2]**2); tmp=None
-      if varname == 'pale'  : 
-         tmp = af.pcurl(self.omex,self.omey,self.omez,dx=self.dx,dy=self.dy,dz=self.dz)
-         self.pale   = 0.5*(tmp[0]**2+tmp[1]**2+tmp[2]**2); tmp=None
-      if varname == 'pal'  : 
-         tmp = af.pcurl(self.omx,self.omy,self.omz,dx=self.dx,dy=self.dy,dz=self.dz)
-         self.pal    = 0.5*(tmp[0]**2+tmp[1]**2+tmp[2]**2); tmp=None
-####
-#### Method to close opened files.
-####
-   def fin(self):
-      """
-         close the run files.
-      """
-      for i in self.vars2l:
-         self.__dict__[i+'f'].close()
-####
-#### Load energies for the run
-####
-   def loadenergies(self):
-      """
-         Loads the energies for the run object along with four different
-         time series: 
-         self.t -> Time in cyclotron units 
-         self.tnl -> Time in units of Nominal nonlinear time 
-                     based on initial energy
-         self.ltnl -> Local Nonlinear time throughout the simulation
-         self.ta -> Turbulence age based on the local nonlinear time.
-      """
-      self.evars=['t', 'eges', 'ebx' , 'eby' , 'ebz' , 'eex' , 'eey' , 'eez' ,\
-      'eem' , 'ekix', 'ekiy', 'ekiz', 'ekex', 'ekey', 'ekez', 'ekin', 'eifx', \
-      'eify', 'eifz', 'eefx', 'eefy', 'eefz', 'eipx', 'eipy', 'eipz', 'eepx', \
-      'eepy', 'eepz']
-      data=np.loadtxt(self.rundir+'/Energies.dat')
-      for i in self.evars:
-         self.__dict__[i]=data[:,self.evars.index(i)]
-      self.eb0=0.5*(self.b0x**2+self.b0y**2+self.b0z**2)
-      self.eb =self.ebx +self.eby +self.ebz
-      self.eip=self.eipx+self.eipy+self.eipz
-      self.eep=self.eepx+self.eepy+self.eepz
-      self.eif=self.eifx+self.eify+self.eifz
-      self.eef=self.eefx+self.eefy+self.eefz
-      self.ee =self.eex +self.eey +self.eez
-      self.edz=self.eb-self.eb0+self.eif+self.eef
-     #self.tnl=self.t*np.sqrt(2*self.edz[0])*2*np.pi/self.lx
-      self.tnl=self.t*np.sqrt(4*self.edz[0])*2*np.pi/self.lx
-      self.ltnl=self.lx/(np.sqrt(self.edz)*4*np.pi)
-      self.ta=np.zeros(len(self.eb))
-      for i in range(1,len(self.eb)):
-         self.ta[i]=self.ta[i-1]+self.dt*2./(self.ltnl[i-1]+self.ltnl[i])
+            if not log_path.is_file():
+                raise FileNotFoundError(
+                    "Compressed movie data require a movie log file."
+                )
 
-###
-### Method to load parameters
-###
-def loadparams(paramfile):
-   params={}
-   def _convert(val):
-       constructors = [int, float, str]
-       for c in constructors:
-           try:
-               return c(val)
-           except ValueError:
-               pass
+            self._movie_log = np.loadtxt(log_path)
 
-   with open(paramfile) as f: 
-      content = f.readlines()
+        if name not in self.logvars:
+            raise KeyError(
+                f"{name!r} is not present in movie log variable list"
+            )
 
-   for item in content:
-      if '#define' in item and item[0] != '!':
-         if len(item.split()) > 2:
-            key = item.split()[1]
-            val = item.split()[2]
-            val = _convert(item.split()[2])
-         else:
-            key = item.split()[1]
-            val = True
-         params[key] = val
+        row = index * len(self.logvars) + self.logvars.index(name)
+        return self._movie_log[row]
 
-   ## For hybrid code, set electron mass to extremely small 
-   ## and speed of light to extremely large.
-   if 'hybrid' in params: 
-      params['c_2'] = 1e9
-      if 'd_e2' in params:
-         params['m_e'] = params['d_e2']
-      else:
-         params['m_e'] = 0.000545
-   for i in ['b0x','b0y','b0z']:
-      if i not in params:
-         params[i]=0.
-   
-   # Set data type
-   if 'eight_byte' in params: params['data_type']='d'
-   elif 'four_byte' in params: params['data_type']='f'
-   elif 'double_byte' in params: params['data_type']='bb'
-   else: params['data_type']='b'
-   #
-   #
-   if params['movie_header'] == '"movie2dC.h"':
-      params['logvars']=['rho', 'jx','jy','jz', 'bx','by','bz', 'ex','ey','ez',
-      'ne', 'jex','jey','jez', 'pexx','peyy','pezz','pexy','peyz','pexz',
-      'ni', 'pixx','piyy','pizz','pixy','piyz','pixz']
-   elif params['movie_header'] == '"movie4b.h"':
-      params['logvars']=['rho', 'jx','jy','jz', 'bx','by','bz', 'ex','ey','ez',
-      'ne','jex','jey','jez', 'pexx','peyy','pezz','pexz','peyz','pexy',
-      'ni','jix','jiy','jiz', 'pixx','piyy','pizz' 'pixz','piyz','pixy']
-   elif params['movie_header'] == '"movie2dD.h"':
-      params['logvars']=['rho', 'jx','jy','jz', 'bx','by','bz', 'ex','ey','ez',
-      'ne', 'jex','jey','jez', 'pexx','peyy','pezz','pexy','peyz','pexz',
-      'ni', 'jix','jiy','jiz', 'pixx','piyy','pizz','pixy','piyz','pixz']
-   elif params['movie_header'] == '"movie3dHeat.h"':
-      params['logvars']=['rho', 'jx','jy','jz', 'bx','by','bz', 'ex','ey','ez',
-      'ne', 'jex','jey','jez', 'pexx','peyy','pezz','pexy', 'peyz', 'pexz',
-      'ni', 'pixx','piyy','pizz','pixy', 'piyz', 'pixz', 'epar1','epar2',
-      'epar3','eperp1','eperp2','eperp3', 'vpar1','vpar2','vpar3']
-   elif params['movie_header'] == '"movie_pic3.0.h"':
-      params['logvars']=['rho', 'jx','jy','jz', 'bx','by','bz', 'ex','ey','ez',
-      'ne', 'jex','jey','jez', 'pexx','peyy','pezz','pexy','peyz','pexz',
-      'ni', 'jix','jiy','jiz', 'pixx','piyy','pizz','pixy','piyz','pixz']
-   else:
-      print('='*80 + \
-                '\t This particular moive headder has not been coded!\n'\
-                '\t Talk to Tulasi to fit it, or fix it yourself.\n'\
-                '\t I dont care, Im a computer not a cop'\
-                '='*80)
-   #
-   #
-   # Derive some others
-   if 'n_movieout' in params:
-      params['dtmovie']=params['n_movieout']*params['dt']
-   else:
-      params['dtmovie']=params['movieout']
-   params['nx']=int(params['pex']*params['nx'])
-   params['ny']=int(params['pey']*params['ny'])
-   params['nz']=int(params['pez']*params['nz'])
-   params['dx']=params['lx']/params['nx']
-   params['dy']=params['ly']/params['ny']
-   params['dz']=params['lz']/params['nz']
-   params['xx']=np.linspace(0.,params['lx'],params['nx'])
-   params['yy']=np.linspace(0.,params['ly'],params['ny'])
-   params['zz']=np.linspace(0.,params['lz'],params['nz'])
-   params['xxt']=np.linspace(0.,2*np.pi,params['nx'])
-   params['yyt']=np.linspace(0.,2*np.pi,params['ny'])
-   params['zzt']=np.linspace(0.,2*np.pi,params['nz'])
-   if all([i in params for i in ['b0x','b0y','b0z']]):
-      params['b0'] =np.sqrt(params['b0x']**2+params['b0y']**2+params['b0z']**2)
-#   params['betai'] = 2*params['n_0']*params['T_i']/params['b0']**2
-#  params['betae'] = 2*params['n_0']*params['T_e']/params['b0']**2
-   params['nprocs'] = int(params['pex']*params['pey']*params['pez'])
-#   params['lambdae']=np.sqrt(params['T_e']/(params['n_0']*params['c_2']))
-   if params['m_e'] != 0:
-      params['wce']=params['b0']/params['m_e']
-      params['vthe']=np.sqrt(2*params['T_e']/params['m_e'])
-   else:
-      params['wce']=1e9
-      params['vthe']=1e9
-   params['de']=np.sqrt(params['m_e'])
-   params['rhoe']=params['vthe']/params['wce']
-   params['wpe']=np.sqrt(params['c_2'])/params['de']
-   params['wpi']=np.sqrt(params['c_2'])
-   params['vthi']=np.sqrt(2*params['T_i'])
-   params['wci']=params['b0']
-   params['rhoi']=params['vthi']/params['wci']
-   params['kgrid'] = max(np.pi/params['dx'], np.pi/params['dy'], np.pi/params['dz'])
-#   params['ca']=params['b0']/np.sqrt(params['n_0']) 
-   
-   return params
+    # ------------------------------------------------------------------
+    # HDF5 snapshots
+    # ------------------------------------------------------------------
+
+    def _load_hdf5(self, index, variables):
+        import h5py
+
+        path = self.rundir / f"{self._hdf_prefix}.{index:03d}.dat"
+
+        if not path.is_file():
+            raise FileNotFoundError(
+                f"HDF5 snapshot not found: {path}"
+            )
+
+        with h5py.File(path, "r") as h5:
+            coords = {
+                "x": np.asarray(h5["xx"][()]),
+                "y": np.asarray(h5["yy"][()]),
+                "z": np.asarray(h5["zz"][()]),
+            }
+
+            shape = (self.nx, self.ny, self.nz)
+            data = {}
+
+            for name in variables:
+                if name not in h5:
+                    raise KeyError(
+                        f"{name!r} not found in {path.name}"
+                    )
+
+                array = h5[name][...]
+
+                if array.shape != shape:
+                    raise ValueError(
+                        f"{name!r} has shape {array.shape}; "
+                        f"expected {shape}"
+                    )
+
+                data[name] = (("x", "y", "z"), array)
+
+            time = float(h5["time"][()])
+
+        ds = xr.Dataset(data, coords=coords)
+        ds.attrs["time"] = time
+
+        return ds.squeeze(drop=True)
+
+    # ------------------------------------------------------------------
+    # Canonical xarray representation
+    # ------------------------------------------------------------------
+
+    def _canonicalize(self, raw, requested):
+        out = xr.Dataset(
+            attrs=raw.attrs.copy()
+        )
+
+        for name in requested:
+            if name in raw:
+                out[name] = raw[name]
+
+            elif name in ("B", "E", "J", "Je", "Ji"):
+                out[name] = _vector(
+                    raw,
+                    CANONICAL_DEPENDENCIES[name],
+                    name,
+                )
+
+            elif name == "ue":
+                out[name] = _vector_from_arrays(
+                    -raw["jex"] / raw["ne"],
+                    -raw["jey"] / raw["ne"],
+                    -raw["jez"] / raw["ne"],
+                    name,
+                )
+
+            elif name == "ui":
+                out[name] = _vector_from_arrays(
+                    raw["jix"] / raw["ni"],
+                    raw["jiy"] / raw["ni"],
+                    raw["jiz"] / raw["ni"],
+                    name,
+                )
+
+            elif name in ("Pe", "Pi"):
+                out[name] = _symmetric_tensor(
+                    raw,
+                    CANONICAL_DEPENDENCIES[name],
+                    name,
+                )
+
+            else:
+                raise KeyError(
+                    f"Could not construct requested variable {name!r}"
+                )
+
+        return out
+
+    # ------------------------------------------------------------------
+    # Setup helpers
+    # ------------------------------------------------------------------
+
+    def _find_paramfile(self):
+        candidates = [
+            self.rundir / f"param_{self.name}",
+            self.rundir / "staging" / f"param_{self.name}",
+            self.rundir / "paramfile",
+        ]
+
+        for path in candidates:
+            if path.is_file():
+                return path
+
+        raise FileNotFoundError(
+            f"No P3D parameter file found in {self.rundir}"
+        )
+
+    def _detect_format(self):
+        snapshots = sorted(self.rundir.glob("*.???.dat"))
+
+        for path in snapshots:
+            with path.open("rb") as f:
+                if f.read(8) == b"\x89HDF\r\n\x1a\n":
+                    self._hdf_prefix = path.name.rsplit(".", 2)[0]
+                    return "hdf5"
+
+        return "movie"
+
+    def _coords(self):
+        return {
+            "x": np.arange(self.nx) * self.dx,
+            "y": np.arange(self.ny) * self.dy,
+            "z": np.arange(self.nz) * self.dz,
+        }
+    
+    def _get_num_slices(self):
+        if self.format == "hdf5":
+            return len(
+                list(self.rundir.glob(f"{self._hdf_prefix}.???.dat"))
+            )
+
+        # legacy movie files
+        sample = self._movie_path("bx")
+
+        bytes_per_value = {
+            "b": 1,
+            "bb": 2,
+            "f": 4,
+            "d": 8,
+        }[self.data_type]
+
+        bytes_per_slice = (
+            self.nx
+            * self.ny
+            * self.nz
+            * bytes_per_value
+        )
+
+        return sample.stat().st_size // bytes_per_slice
+
+
+# ----------------------------------------------------------------------
+# Canonical field builders
+# ----------------------------------------------------------------------
+
+def _vector(ds, names, name):
+    return _vector_from_arrays(
+        ds[names[0]],
+        ds[names[1]],
+        ds[names[2]],
+        name,
+    )
+
+
+def _vector_from_arrays(x, y, z, name):
+    spatial_dims = x.dims
+
+    da = xr.concat(
+        [x, y, z],
+        dim=xr.IndexVariable(
+            "c",
+            ["x", "y", "z"],
+        ),
+    )
+
+    return da.transpose(
+        *spatial_dims,
+        "c",
+    ).rename(name)
+
+
+def _symmetric_tensor(ds, names, name):
+    xx, xy, xz, yy, yz, zz = [
+        ds[n] for n in names
+    ]
+
+    labels = ["x", "y", "z"]
+
+    row_x = xr.concat(
+        [xx, xy, xz],
+        dim=xr.IndexVariable("j", labels),
+    )
+
+    row_y = xr.concat(
+        [xy, yy, yz],
+        dim=xr.IndexVariable("j", labels),
+    )
+
+    row_z = xr.concat(
+        [xz, yz, zz],
+        dim=xr.IndexVariable("j", labels),
+    )
+
+    tensor = xr.concat(
+        [row_x, row_y, row_z],
+        dim=xr.IndexVariable("i", labels),
+    )
+
+    return tensor.transpose(
+        *xx.dims,
+        "i",
+        "j",
+    ).rename(name)
+
+
+# ----------------------------------------------------------------------
+# Parameter file
+# ----------------------------------------------------------------------
+
+def load_params(paramfile):
+    params = {}
+
+    with open(paramfile) as f:
+        for line in f:
+            parts = line.split()
+
+            if (
+                len(parts) < 2
+                or parts[0] != "#define"
+            ):
+                continue
+
+            key = parts[1]
+
+            if len(parts) == 2:
+                value = True
+            else:
+                raw = parts[2]
+
+                try:
+                    value = int(raw)
+                except ValueError:
+                    try:
+                        value = float(raw)
+                    except ValueError:
+                        value = raw
+
+            params[key] = value
+
+    # Data type.
+    if "eight_byte" in params:
+        params["data_type"] = "d"
+    elif "four_byte" in params:
+        params["data_type"] = "f"
+    elif "double_byte" in params:
+        params["data_type"] = "bb"
+    else:
+        params["data_type"] = "b"
+
+    # Movie cadence.
+    if "n_movieout" in params:
+        params["dtmovie"] = (
+            params["n_movieout"] * params["dt"]
+        )
+    else:
+        params["dtmovie"] = params["movieout"]
+
+    # Global grid.
+    params["nx"] = int(params["pex"] * params["nx"])
+    params["ny"] = int(params["pey"] * params["ny"])
+    params["nz"] = int(params["pez"] * params["nz"])
+
+    params["dx"] = params["lx"] / params["nx"]
+    params["dy"] = params["ly"] / params["ny"]
+    params["dz"] = params["lz"] / params["nz"]
+
+    # Needed only for byte-compressed legacy movie output.
+    movie_header = params.get("movie_header")
+
+    movie_logvars = {
+        '"movie2dC.h"': [
+            "rho", "jx", "jy", "jz",
+            "bx", "by", "bz",
+            "ex", "ey", "ez",
+            "ne", "jex", "jey", "jez",
+            "pexx", "peyy", "pezz",
+            "pexy", "peyz", "pexz",
+            "ni",
+            "pixx", "piyy", "pizz",
+            "pixy", "piyz", "pixz",
+        ],
+        '"movie4b.h"': [
+            "rho", "jx", "jy", "jz",
+            "bx", "by", "bz",
+            "ex", "ey", "ez",
+            "ne", "jex", "jey", "jez",
+            "pexx", "peyy", "pezz",
+            "pexz", "peyz", "pexy",
+            "ni", "jix", "jiy", "jiz",
+            "pixx", "piyy", "pizz",
+            "pixz", "piyz", "pixy",
+        ],
+        '"movie2dD.h"': [
+            "rho", "jx", "jy", "jz",
+            "bx", "by", "bz",
+            "ex", "ey", "ez",
+            "ne", "jex", "jey", "jez",
+            "pexx", "peyy", "pezz",
+            "pexy", "peyz", "pexz",
+            "ni", "jix", "jiy", "jiz",
+            "pixx", "piyy", "pizz",
+            "pixy", "piyz", "pixz",
+        ],
+        '"movie_pic3.0.h"': [
+            "rho", "jx", "jy", "jz",
+            "bx", "by", "bz",
+            "ex", "ey", "ez",
+            "ne", "jex", "jey", "jez",
+            "pexx", "peyy", "pezz",
+            "pexy", "peyz", "pexz",
+            "ni", "jix", "jiy", "jiz",
+            "pixx", "piyy", "pizz",
+            "pixy", "piyz", "pixz",
+        ],
+    }
+
+    params["logvars"] = movie_logvars.get(
+        movie_header,
+        [],
+    )
+
+    return params
+    
