@@ -1,197 +1,103 @@
+
 import numpy as np
 import xarray as xr
-from scipy.fft import fftn, fftfreq
 
 
-def energy_spectrum(
-    da,
-    spatial_dims=("x", "y"),
-    component_dim="c",
-    subtract_mean=True,
-    energy_factor=0.5,
-):
+def energy_spectrum(ar, sumax=2, lenx=2*np.pi, leny=2*np.pi, lenz=2*np.pi):
     """
-    Compute the isotropic 2D energy spectrum E(k).
+    Compute the perpendicular energy spectrum of a scalar or vector field.
 
     Parameters
     ----------
-    da : xr.DataArray
-        Scalar or vector field.
-
-        Examples:
-            scalar: (x, y)
-            vector: (x, y, c)
-
-    spatial_dims : tuple
-        Spatial dimensions over which to Fourier transform.
-
-    component_dim : str
-        Vector-component dimension. Ignored if absent.
-
-    subtract_mean : bool
-        Remove the spatial mean before computing the spectrum.
-
-    energy_factor : float
-        Multiplicative factor in the energy definition.
-
-        Default:
-            E = 1/2 |f|^2
+    ar : xr.DataArray
+        Scalar field: dimensions ('x', 'y')
+        Vector field: dimensions ('x', 'y', 'c')
+    sumax : int
+        Magnetic-field direction (only sumax=2 supported).
+    lenx, leny, lenz : float
+        Physical domain lengths.
 
     Returns
     -------
-    xr.DataArray
-        Isotropic shell-integrated energy spectrum E(k).
-
-        The normalization is chosen so that approximately
-
-            integral E(k) dk
-                =
-            energy_factor * <|f|^2>
-
-        for the resolved field.
+    kk : xr.DataArray
+        Perpendicular wavenumbers.
+    fekp : xr.DataArray
+        Perpendicular energy spectrum.
     """
 
-    # ---------------------------------------------------------
-    # Validate grid
-    # ---------------------------------------------------------
+    if sumax != 2:
+        raise NotImplementedError("Only sumax=2 is supported.")
 
-    if len(spatial_dims) != 2:
-        raise ValueError(
-            "energy_spectrum currently expects two spatial dimensions."
-        )
+    # Detect scalar or vector field
+    vector = "c" in ar.dims
 
-    for dim in spatial_dims:
-        if dim not in da.dims:
-            raise ValueError(
-                f"{dim!r} is not present in {da.dims}"
-            )
+    if vector:
+        ar = ar.transpose("x", "y", "c")
+    else:
+        ar = ar.transpose("x", "y")
 
-    dx = float(np.mean(np.diff(da[spatial_dims[0]].values)))
-    dy = float(np.mean(np.diff(da[spatial_dims[1]].values)))
+    arr = ar.to_numpy()
+    nx, ny = arr.shape[:2]
 
-    nx = da.sizes[spatial_dims[0]]
-    ny = da.sizes[spatial_dims[1]]
+    if nx < 2 or ny < 2:
+        raise ValueError("Both spatial dimensions must contain at least 2 points.")
 
-    # ---------------------------------------------------------
-    # Remove spatial mean
-    # ---------------------------------------------------------
+    # Remove spatial mean independently for each component
+    arr = arr - np.mean(arr, axis=(0, 1), keepdims=True)
 
-    field = da
+    # Original wavenumber calculation
+    kx = np.fft.fftshift(np.fft.fftfreq(nx)) * nx * (2*np.pi/lenx)
+    ky = np.fft.fftshift(np.fft.fftfreq(ny)) * ny * (2*np.pi/leny)
 
-    if subtract_mean:
-        field = field - field.mean(spatial_dims)
+    # FFT along spatial dimensions only
+    far = np.fft.fftshift(
+        np.fft.fftn(arr, axes=(0, 1)),
+        axes=(0, 1)
+    ) / (nx * ny)
 
-    # ---------------------------------------------------------
-    # Fourier transform
-    # ---------------------------------------------------------
+    # Fourier energy
+    if vector:
+        energy = 0.5 * np.sum(np.abs(far)**2, axis=2)
+    else:
+        energy = 0.5 * np.abs(far)**2
 
-    axes = tuple(
-        field.get_axis_num(dim)
-        for dim in spatial_dims
+    # Perpendicular wavenumber magnitude
+    kp = np.sqrt(kx[:, None]**2 + ky[None, :]**2)
+
+    # Original radial-bin definitions
+    dk = np.abs(kp[1, 0] - kp[0, 0])
+    kk = kp[nx//2, ny//2:]
+
+    nbins = min(nx//2, ny//2)
+    kk = kk[:nbins]
+
+    # Sort wavenumbers and corresponding Fourier energies
+    order = np.argsort(kp.ravel())
+    k_sorted = kp.ravel()[order]
+    e_sorted = energy.ravel()[order]
+
+    # Preserve original strict radial-shell boundaries
+    lower = np.searchsorted(k_sorted, kk - dk, side="right")
+    upper = np.searchsorted(k_sorted, kk + dk, side="left")
+
+    # Direct shell summation (avoids cumulative-sum cancellation)
+    fekp = np.array([
+        np.sum(e_sorted[lo:hi])
+        for lo, hi in zip(lower, upper)
+    ]) / dk
+
+    # Return xarray objects
+    kk = xr.DataArray(
+        kk,
+        dims="kperp",
+        name="kperp"
     )
 
-    fhat = fftn(
-        field.values,
-        axes=axes,
+    fekp = xr.DataArray(
+        fekp,
+        dims="kperp",
+        coords={"kperp": kk.values},
+        name="E_kperp"
     )
 
-    # ---------------------------------------------------------
-    # Modal energy
-    #
-    # Parseval:
-    #
-    # mean(|f|^2)
-    #     =
-    # sum(|F|^2) / (Nx Ny)^2
-    # ---------------------------------------------------------
-
-    normalization = (nx * ny) ** 2
-
-    modal_energy = (
-        energy_factor
-        * np.abs(fhat) ** 2
-        / normalization
-    )
-
-    # If vector-valued, sum over vector components.
-    if component_dim in field.dims:
-        component_axis = field.get_axis_num(component_dim)
-
-        modal_energy = modal_energy.sum(
-            axis=component_axis
-        )
-
-    # ---------------------------------------------------------
-    # Wavenumbers
-    # ---------------------------------------------------------
-
-    kx = 2.0 * np.pi * fftfreq(
-        nx,
-        d=dx,
-    )
-
-    ky = 2.0 * np.pi * fftfreq(
-        ny,
-        d=dy,
-    )
-
-    KX, KY = np.meshgrid(
-        kx,
-        ky,
-        indexing="ij",
-    )
-
-    kmag = np.sqrt(
-        KX**2 + KY**2
-    )
-
-    # ---------------------------------------------------------
-    # Isotropic shells
-    # ---------------------------------------------------------
-
-    dkx = 2.0 * np.pi / (nx * dx)
-    dky = 2.0 * np.pi / (ny * dy)
-
-    dk = min(dkx, dky)
-
-    kmax = kmag.max()
-
-    edges = np.arange(
-        0.0,
-        kmax + dk,
-        dk,
-    )
-
-    shell_energy, _ = np.histogram(
-        kmag.ravel(),
-        bins=edges,
-        weights=modal_energy.ravel(),
-    )
-
-    # Spectrum density so sum(E(k) dk) = total energy
-    E = shell_energy / dk
-
-    k = 0.5 * (
-        edges[:-1]
-        + edges[1:]
-    )
-
-    # ---------------------------------------------------------
-    # Return xarray
-    # ---------------------------------------------------------
-
-    spectrum = xr.DataArray(
-        E,
-        dims=("k",),
-        coords={"k": k},
-        name="E",
-    )
-
-    spectrum.attrs.update({
-        "long_name": "isotropic energy spectrum",
-        "spatial_dims": spatial_dims,
-        "subtract_mean": subtract_mean,
-        "energy_factor": energy_factor,
-    })
-
-    return spectrum
+    return kk, fekp
